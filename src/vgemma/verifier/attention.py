@@ -3,8 +3,15 @@
 Q and K are captured after q_norm / k_norm and before RoPE. The verifier applies RoPE from the
 public parameters with the rounding of a bf16 eager forward (sliding layers: default RoPE over the
 full head; global layers: proportional RoPE rotating the first 25 % of the pairs), computes scores
-with scale 1.0 (QK-norm replaces 1/sqrt(d)), the causal and sliding-window mask, a float64 softmax
+with scale 1.0 (QK-norm replaces 1/sqrt(d)), the causal and sliding-window mask, the softmax
 and the weighted sum of the V rows, and compares with the captured attention output ``a``.
+
+The softmax and weighted sum follow the rounding of the declared ``attn_implementation``, measured
+on CPU (tiny) and GPU (Gemma 4 12B, A100), docs/DECISIONS.md 44:
+
+* ``sdpa``: f32 scores, the unnormalised probabilities ``P`` rounded to bf16 for the ``P V``
+  product, normalised by the f32 sum (flash-attention style);
+* ``eager``: scores rounded to bf16 (bf16 matmul output), softmax in f32, weights rounded to bf16.
 
 Statistic: ``max_h ||a_h - ref_h||_2 / (||ref_h||_2 + ATTN_FLOOR sqrt(head_dim))``, bound ``ATTN_REL``.
 """
@@ -13,10 +20,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from vgemma.canon import apply_rope_bf16, bf16_to_f64, rope_cos_sin
+from vgemma.canon import apply_rope_bf16, bf16_to_f64, f32_to_bf16, rope_cos_sin
 from vgemma.profile import GemmaProfile
 
-# Set from measured honest deviations with margin (docs/DECISIONS.md); printed in every verdict.
+# Honest worst with the matching numerics: 0.0029 on tiny CPU, 0.0075 on Gemma 4 12B / A100 over 1,500+
+# replays (p99 0.0036); the bound is about 4x the worst measured value (docs/DECISIONS.md 44).
 ATTN_REL = 2.0**-5
 ATTN_FLOOR = 2.0**-14
 
@@ -29,6 +37,7 @@ def replay(
     k_rows: np.ndarray,
     v_rows: np.ndarray,
     key_positions: list[int],
+    attn_implementation: str = "sdpa",
 ) -> np.ndarray:
     """Recompute ``a`` ``[heads * head_dim]`` for query ``pos`` from pre-RoPE q_n ``[H, hd]`` and the
     window's k_n / v_n rows ``[n, KV, hd]`` (bf16 bits)."""
@@ -43,10 +52,18 @@ def replay(
     for h in range(n_heads):
         g = h // group
         s = k[:, g, :] @ q[h]  # scaling 1.0
-        w = np.exp(s - s.max())
-        w /= w.sum()
-        out[h] = w @ v[:, g, :]
+        if attn_implementation == "eager":
+            s = _bf16(s)
+            p = np.exp(s - s.max())
+            out[h] = _bf16(p / p.sum()) @ v[:, g, :]
+        else:
+            p = np.exp(s - s.max())
+            out[h] = (_bf16(p) @ v[:, g, :]) / p.sum()
     return out.reshape(-1)
+
+
+def _bf16(x: np.ndarray) -> np.ndarray:
+    return bf16_to_f64(f32_to_bf16(np.asarray(x, dtype=np.float32)))
 
 
 def deviation(profile: GemmaProfile, layer: int, a_bits: np.ndarray, ref: np.ndarray) -> float:

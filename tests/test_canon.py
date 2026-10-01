@@ -224,3 +224,17 @@ def test_sampler_deterministic_across_processes():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
     assert int(out[0]) == tok and float(out[1]) == wit["u"] and out[2] == wit["postcap"]
+
+
+def test_descending_order_equals_stable_argsort():
+    from vgemma.prover.sampler import descending_order
+
+    rng = np.random.default_rng(9)
+    for trial in range(200):
+        n = int(rng.integers(2, 3000))
+        z = rng.integers(-5, 5, n).astype(np.float64) if trial % 2 else rng.standard_normal(n)  # heavy ties
+        z[rng.integers(0, n, 3)] = 0.0
+        if trial % 7 == 0:
+            z[:5] = -0.0
+        for k in (1, 2, 5, 64, n - 1, n, 0):
+            assert np.array_equal(descending_order(z, k), np.argsort(-z, kind="stable")[: k if k > 0 else n])

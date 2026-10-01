@@ -32,14 +32,24 @@ def uniform_for_step(seed: bytes, step: int) -> float:
     return (int.from_bytes(d[:8], "little") >> 11) / float(1 << 53)
 
 
+def descending_order(z: np.ndarray, k: int) -> np.ndarray:
+    """Exactly ``np.argsort(-z, kind="stable")[:k]`` (all when ``k <= 0``), in O(n) for small ``k``."""
+    n = z.size
+    if k <= 0 or k >= n:
+        return np.argsort(-z, kind="stable")
+    kth = np.partition(z, n - k)[n - k]  # the k-th largest value
+    above = np.flatnonzero(z > kth)
+    ties = np.flatnonzero(z == kth)[: k - above.size]  # lowest indices first, as a stable sort keeps them
+    cand = np.concatenate([above, ties])
+    return cand[np.lexsort((cand, -z[cand]))]
+
+
 def sample(logits_postcap: np.ndarray, policy: SamplingPolicy, u: float) -> int:
     z = np.asarray(logits_postcap, dtype=np.float32).astype(np.float64)
     if policy.greedy or policy.temperature == 0.0:
         return int(np.argmax(z))  # first maximum: lowest index wins ties
     z = z / float(policy.temperature)
-    order = np.argsort(-z, kind="stable")  # descending, ties by lower index
-    if policy.top_k and policy.top_k > 0:
-        order = order[: policy.top_k]
+    order = descending_order(z, policy.top_k)  # descending, ties by lower index, first top_k
     zk = z[order]
     e = exp_f64(zk - zk[0])
     if policy.top_p < 1.0:

@@ -422,7 +422,8 @@ class _Run:
                 rows = list(prof.window(layer, p))
                 k_rows = np.stack([self.t(j, layer, "k_n") for j in rows])
                 v_rows = np.stack([self.t(j, layer, "v_n") for j in rows])
-                ref = attention.replay(prof, layer, p, T("q_n"), k_rows, v_rows, rows)
+                impl = self.receipt["manifest"]["attn_implementation"]
+                ref = attention.replay(prof, layer, p, T("q_n"), k_rows, v_rows, rows, impl)
                 return attention.deviation(prof, layer, T("a"), ref), attention.ATTN_REL
 
             self.tol("ATTN_REPLAY", replay, layer, p, unit="rel L2")

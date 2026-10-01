@@ -144,3 +144,16 @@ def test_verifier_needs_no_torch():
     code = "import sys, vgemma.verifier.verify, vgemma.verifier.key; print('torch' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
     assert out == "False"
+
+
+@pytest.mark.parametrize("attn", ["sdpa", "eager"])
+def test_attention_replay_follows_declared_kernel(make_engine, keys, attn):
+    """Honest replay margins with the kernel's rounding: well inside the audit bound for both paths."""
+    eng = make_engine(attn=attn)
+    worst = 0.0
+    for i in range(8):
+        r = Run(eng, request_id=f"r_attn_{attn}_{i}", positions="all-gen", layers="full")
+        v = check(keys, r.receipt, r.opening, r.challenge)
+        assert v["result"] == "PASS", dump(v)
+        worst = max(worst, v["checks"]["ATTN_REPLAY"]["max_ratio"])
+    assert worst < 0.5, worst

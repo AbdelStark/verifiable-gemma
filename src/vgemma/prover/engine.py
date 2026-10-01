@@ -5,9 +5,11 @@ receipts and openings (TECH_SPEC sections 5, 6, 8).
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -106,11 +108,15 @@ def commit_trace(trace: Trace, profile: GemmaProfile) -> Commitment:
     """Layer leaves, position leaves, trace root and IO chain for a captured trace (no receipt yet)."""
     n_pos, n_groups = trace.n_positions, profile.num_layers + 1
     layer_leaves = np.zeros((n_pos, n_groups, 32), dtype=np.uint8)
-    for layer in range(n_groups):
+
+    def hash_group(layer: int) -> None:
         arrs = [trace.layers[layer][n] for n in profile.group_names(layer)]
         for p in range(n_pos):
             leaf = layer_leaf(layer, p, [tensor_hash(a[p]) for a in arrs])
             layer_leaves[p, layer] = np.frombuffer(leaf, dtype=np.uint8)
+
+    with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:  # sha256 releases the GIL
+        list(pool.map(hash_group, range(n_groups)))
     lhs = [logits_hash(trace.logits_precap[t]) for t in range(trace.n_gen)]
     whs = [witness_hash(w) for w in trace.witnesses]
     bodies = np.zeros((n_pos, 32), dtype=np.uint8)
@@ -294,7 +300,10 @@ class Engine:
                 log("WARNING: served embedding root differs from public params")
         import torch
 
-        torch.backends.cuda.matmul.allow_tf32 = False  # the LM-head bound assumes true f32 accumulation
+        # The Freivalds bounds assume f32 accumulation and one rounding of the output: no TF32 for the
+        # f32 LM head, and no bf16 partial sums in split-K GEMMs (common for single-token decode).
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
         torch.set_float32_matmul_precision("highest")
         self.lm_head_f32 = lm.lm_head.weight.detach().float()  # [vocab, hidden], the head actually served
         self.capture = CaptureHooks(lm)

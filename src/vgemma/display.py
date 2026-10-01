@@ -15,7 +15,7 @@ CLAIM_TABLE = [
     ("Soft-cap and sampled token, every token", "verified (exact)", "canonical soft-cap, shared sampler, nonce seed"),
     ("Bindings: prompt, request, manifest, seed, count, IO", "verified (exact)", "hashes, signature, Merkle"),
     ("K/V provenance", "audited", "every attended row Merkle-bound to the trace root"),
-    ("Attention output at challenged positions", "audited", "single-query float64 replay, tolerance 2^-5"),
+    ("Attention output at challenged positions", "audited", "replay with the kernel's rounding, 2^-5"),
     ("Wiring: layer types, window, head dims, RoPE, QK-norm", "audited", "manifest hashes + opened shapes"),
     ("Positions and layers not drawn by the auditor", "open", "spot check: random positions, routine layers"),
     ("Consistent fake attention output a", "open", "CommitLLM residual hole; needs Q retention or fixed kernels"),

@@ -335,6 +335,7 @@ def run_bench(
     n_layers = key.profile.num_layers
     rows: dict[str, Any] = {}
     margins: dict[str, float] = {}
+    quantiles: dict[str, Any] = {}
     rng = secrets.SystemRandom()
     gen = list(range(r["n_prompt"] - 1, n_pos))
     three = sorted(rng.sample(gen, min(3, len(gen))))
@@ -360,6 +361,8 @@ def run_bench(
         for code, st in v["checks"].items():
             if st["worst"] is not None:
                 margins[code] = max(margins.get(code, 0.0), st["max_ratio"])
+        if label == "calibrate":
+            quantiles = {c: st["ratio_quantiles"] for c, st in v["checks"].items() if "ratio_quantiles" in st}
         n = len(positions)
         rows[label] = {
             "layers": len(layers),
@@ -392,6 +395,7 @@ def run_bench(
         "commit_s": res.timings["commit_s"],
         "audits": rows,
         "honest_deviation_over_bound": margins,
+        "calibration_quantiles": quantiles,
         "keygen_s": kg.get("seconds"),
         "key_bytes": kg.get("key_bytes"),
         "freivalds_k": kg.get("freivalds_k"),
@@ -406,6 +410,8 @@ def run_bench(
     log(f"  keygen             {kg.get('seconds', float('nan')):.2f} s, key {fmt_bytes(kg.get('key_bytes', 0))}")
     log("  honest deviation as a fraction of each bound (worst over all audited checks):")
     for code, m in sorted(margins.items(), key=lambda kv: -kv[1]):
-        log(f"    {code:22s} {100 * m:6.1f}%")
+        qs = quantiles.get(code)
+        dist = f"   calibrate p50 {100 * qs['p50']:.1f}%  p99 {100 * qs['p99']:.1f}%" if qs else ""
+        log(f"    {code:22s} {100 * m:6.1f}%{dist}")
     (workdir / "bench.json").write_text(json.dumps(metrics, indent=1, default=str))
     return metrics
