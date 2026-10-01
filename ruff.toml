@@ -1,0 +1,10 @@
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E741"]
+
+[lint.per-file-ignores]
+"src/vgemma/cli.py" = ["B008"]

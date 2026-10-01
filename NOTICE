@@ -1,0 +1,32 @@
+verifiable-gemma
+Copyright (c) 2026 AbdelStark. Licensed under the MIT License (see LICENSE).
+
+Protocol lineage: CommitLLM
+  Repository: https://github.com/lambdaclass/CommitLLM
+  Licence:    MIT, Copyright (c) 2026 LambdaClass
+  Upstream commit read: 25541e83347655e44ad6e84eb901e1e7ae392a66 (2026-06-12)
+
+  verifiable-gemma applies the CommitLLM commit-and-audit protocol to Gemma 4. The protocol design
+  and its vocabulary follow CommitLLM: commit / audit / opening, routine and full audit tiers,
+  Freivalds checks per matrix family, bridge replay, captured-logits decode with LM-head binding,
+  receipt bindings (prompt, manifest, seed, token count, IO chain), reason-code style, and the
+  verified / audited / open claim boundary with its residual hole (the consistent fake attention
+  output, as described in the CommitLLM README). The adversarial suite (tests/test_adversarial_tiny.py)
+  mirrors the scenario list of scripts/modal/tests/llama/test_adversarial.py.
+
+  Files read for structure only; no code was copied or adapted:
+    README.md, LICENSE, scripts/modal/tests/llama/test_adversarial.py (scenario names and expected
+    rejection classes)
+
+  If code is copied from CommitLLM in the future, keep its MIT header and add a line here:
+    <upstream path> -> <local path>: <what changed>
+
+Model: Gemma 4 by Google DeepMind
+  google/gemma-4-12B-it and google/gemma-4-31B-it, Apache License 2.0.
+  No weights are distributed with this repository. The tiny test checkpoint is randomly
+  initialised from a shrunk copy of the Gemma 4 12B text configuration.
+
+Reference implementation: Hugging Face transformers (Apache License 2.0)
+  src/transformers/models/gemma4/modeling_gemma4.py, models/gemma4_unified/modeling_gemma4_unified.py
+  and modeling_rope_utils.py (proportional RoPE) were read to write the canonical functions in
+  src/vgemma/canon.py, which are tested against those modules; no code was copied.

@@ -4,3 +4,22 @@ dist/
 target/
 **/venv
 .venv/
+
+# secrets and credentials (never commit)
+.env
+.env.*
+keys/
+*.npz
+
+# runtime state and artefacts
+state/
+.vg/
+tiny-gemma4/
+*.safetensors
+receipt.json
+opening.bin
+verdict.json
+__pycache__/
+.modal/
+.pytest_cache/
+.ruff_cache/
