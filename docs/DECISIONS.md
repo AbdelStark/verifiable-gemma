@@ -61,3 +61,22 @@ A second pass confirmed that 26 to 35 close the original holes, and found three 
 
 42. **The verdict reports two escape probabilities.** A residual stream forged at one layer boundary is caught by any audit of the producing layer (`forged_boundary_escape`). A fake attention output at one layer is caught only by audits that replay attention (`fake_attention_escape`). Before: only the first was printed, which overstated how well decode audits (attention off) cover the audited-only attention path. `vg audit --decode-attention` extends the replay to decode audits, at the cost of opening every attended K/V row.
 43. **`check_expected` now enforces every client field** (policy, `attn_implementation`, tokenizer and template hashes). The earlier edit had defined the list but left the loop on the policy fields only.
+
+## First real-model run (Gemma 4 12B-it, A100-40GB, 2026-10-01)
+
+44. **The attention replay follows the declared kernel's rounding.**
+    - The first GPU demo failed an honest audit (`ATTN_REPLAY` 0.039 against 2^-5), and tiny `eager` runs reached 99.9 % of the bound.
+    - Replaying the downloaded GPU opening under three numerics models showed:
+      - `sdpa` matches flash-attention rounding (f32 scores, bf16 `P` for `P V`, f32 normalisation): worst 0.0036 on GPU, 0.0027 on tiny CPU;
+      - `eager` matches bf16 scores and weights: 0.0029 on tiny CPU;
+      - the exact f64 replay deviates up to 0.029 (GPU) and 0.025 (eager).
+    - The replay now uses the model for the manifest's `attn_implementation`, which is signed and pinned by the client.
+    - The bound was first tightened to 2^-6. The calibrating bench (1,536 replays per run) then measured an honest worst of 0.0075, so it went back to 2^-5: about 4x the worst measured value, and the honest p99 is 11 % of the bound.
+45. **The prover disables `allow_bf16_reduced_precision_reduction`** (PyTorch's default is True), so cuBLAS cannot use bf16 partial sums in split-K GEMMs. Single-token decode GEMMs often split K, and the Freivalds bound assumes f32 accumulation with one output rounding.
+46. **The sampler takes its top-k by partition instead of a full stable sort.** `descending_order` returns exactly `argsort(-z, stable)[:k]` (equivalence test with heavy ties and signed zeros), at 2.3 ms instead of 17 ms per token over 262k logits. Plain decode on 12B went from 9.8 to 12.2 tokens/s.
+47. **Commitment hashing runs per layer group in a thread pool** (SHA-256 releases the GIL). It still takes 1.3 s for 56 positions of 10 MiB each on 12B, which is the 47 % serving overhead. Tier 2's compact retained state is the real fix.
+48. **Real-model results** (Gemma 4 12B-it, A100-40GB, three demo runs):
+    - Honest PASS on routine and full audits, and the four tamper FAILs with the expected codes.
+    - The 3 % rank-8 `down_proj` tamper was caught at 1.07x, 1.7x and 2.2x the bound, so its detection depends on position and sits near the Tier 1 threshold.
+    - The default challenge on 32 tokens opens 51.9 MiB, verifies in 1.77 s on CPU, and leaves a forged-boundary escape probability of 0.27.
+    - Throughput is HF eager decoding at batch 1: 12.2 tokens/s plain, 9.3 with capture.

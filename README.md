@@ -10,9 +10,10 @@ deployment configuration and sampling policy produced the answer. There is no ze
 and no per-response proof. The provider runs its normal GPU path and opens only what is challenged.
 
 Status: Tier 1 MVP (Python on `transformers`, bf16, tolerance-bounded linear checks, exact decode).
-`vg demo --tiny` passes on CPU, and the 255-test suite runs in about 15 s. The real-model path
-(`google/gemma-4-12B-it` on one GPU) is implemented and wired into Modal but has not been run yet,
-so the GPU columns below are empty. Read [PRD.md](PRD.md) and [TECH_SPEC.md](TECH_SPEC.md) for the
+`vg demo --tiny` passes on CPU, and the 258-test suite runs in about 15 s. On the real model,
+`google/gemma-4-12B-it` on one A100-40GB launched from `infra/modal_app.py`, `vg demo` gives an
+honest PASS on routine and full audits and the four tamper FAILs with the expected codes; the
+GPU metrics below come from those runs. Read [PRD.md](PRD.md) and [TECH_SPEC.md](TECH_SPEC.md) for the
 design, [docs/DECISIONS.md](docs/DECISIONS.md) for where the implementation departs from the draft
 spec, and [docs/SCHEMAS.md](docs/SCHEMAS.md) for every hashed format.
 
@@ -37,6 +38,19 @@ uv run vg serve ... --tamper weights|identity|sampling|softcap           # demo 
 ```
 
 ## What the demo shows
+
+On Gemma 4 12B-it (A100-40GB, Modal; the routine audit draws 10 of 48 layers per full audit):
+
+```
+  [ok ] honest    routine:10 PASS                  (expected PASS)
+  [ok ] honest    full       PASS                  (expected PASS)
+  [ok ] weights   full       FAIL FREIVALDS_WDOWN  (expected FREIVALDS_WDOWN)  layer 24  deviation 0.147 > tolerance 0.0663
+  [ok ] identity  full       FAIL FREIVALDS_WQ     (expected FREIVALDS_WQ)  layer 0  deviation 3.49e+03 > tolerance 23.4
+  [ok ] sampling  full       FAIL DECODE_SAMPLING  (expected DECODE_SAMPLING)
+  [ok ] softcap   full       FAIL DECODE_SOFTCAP   (expected DECODE_SOFTCAP)
+```
+
+On the tiny CPU model:
 
 ```
   [ok ] honest    routine:3  PASS                  (expected PASS)
@@ -90,22 +104,29 @@ Every verdict prints, for each check, the worst observed deviation, the bound an
 
 ### Tolerances, and why they are what they are
 
-| Check | Bound | Honest worst case, tiny CPU |
-|---|---|---|
-| Freivalds (every shell family) | `RMS_j(r_j·y - v_j·x) <= (3·2^-8 + 8·sqrt(K)·2^-24)·‖y‖₂` | 20 to 24 % of the bound |
-| LM-head binding (f32 logits) | same statistic with `3·2^-24` instead of `3·2^-8` | 1.3 % |
-| Norms | `|y - ref| <= 2^-7·|ref| + 2^-126` elementwise | 50 % |
-| GELU gate | `|h - ref| <= 2^-6·|ref| + 2^-20·|g·u| + 2^-126` | 45 % |
-| KV_SHARED | 1 bf16 ulp | 0 ulps |
-| Attention replay (audited) | per head `‖a - ref‖₂ / ‖ref‖₂ <= 2^-5` | 8 to 11 % |
+| Check | Bound | Honest worst, tiny CPU | Honest worst, 12B on A100 (1,500+ checks) |
+|---|---|---|---|
+| Freivalds (every shell family) | `RMS_j(r_j·y - v_j·x) <= (3·2^-8 + 8·sqrt(K)·2^-24)·‖y‖₂` | 20 to 24 % | 28 % (p99 23 %) |
+| LM-head binding (f32 logits) | same statistic with `3·2^-24` instead of `3·2^-8` | 1.3 % | 0.4 % |
+| Norms | `|y - ref| <= 2^-7·|ref| + 2^-126` elementwise | 50 % | 49.8 % |
+| GELU gate | `|h - ref| <= 2^-6·|ref| + 2^-20·|g·u| + 2^-126` | 45 % | 49.3 % |
+| KV_SHARED | 1 bf16 ulp | 0 ulps | 0 ulps |
+| Attention replay (audited), with the declared kernel's rounding | per head `‖a - ref‖₂ / ‖ref‖₂ <= 2^-5` | 12 % | 13 % (p99 11 %) |
 
 The draft spec's Freivalds bound (`2^-7·‖y‖₁` with one vector) could not detect its own 3 % weights
 tamper on any real layer, because a ±1 projection of the change grows with `‖Δy‖₂` while that bound
 grows with `sqrt(m)·‖y‖₂`. The implemented statistic averages 16 secret projections. Its bound holds
 with probability above 1 - 10^-20 over the secret vectors for an honest prover, and it rejects any
-change larger than about 1.2 % of an output's L2 norm (TECH_SPEC section 11). The attention bound was
-set from the tiny CPU measurements with a 9x margin, and has to be re-measured on GPU with
-`vg bench --calibrate` before it is quoted for a real model.
+change larger than about 1.2 % of an output's L2 norm (TECH_SPEC section 11). The attention replay
+follows the rounding of the declared `attn_implementation`: flash-style bf16 probabilities for
+`sdpa`, bf16 scores and weights for `eager`. An exact f64 replay deviated up to 0.029 on the GPU
+and produced one honest false positive in the first real-model demo; with the matching model the
+worst of 1,500+ GPU replays is 0.0075, about 4x inside the bound (DECISIONS 44).
+
+Detection power on the real model is thinner than on tiny. The spec's 3 % rank-8 `down_proj`
+tamper on Gemma 4 12B was caught in all three demo runs, at 1.07x, 1.7x and 2.2x the bound
+depending on the audited position. Changes at that size sit near the Tier 1 bf16 threshold; the
+exact Tier 2 path is what makes such small changes reliably detectable.
 
 ## Metrics
 
@@ -115,17 +136,19 @@ model this small the timing overheads are noisy between runs.
 
 | Metric | tiny, CPU | gemma-4-12B-it, A100-40GB |
 |---|---|---|
-| Decode overhead of capture | -6 to 15 % across runs (about 340 tokens/s) | not run yet |
-| Serve overhead incl. commitment | 17 to 29 % (commitment hashing dominates a tiny forward) | not run yet |
-| Retained state per position | 16.3 KiB | not run yet (spec estimate: about 10 MB plus 1 MiB of logits) |
-| Opening per full audit, routine (3 layers) / all layers | 76 KiB / 167 KiB | not run yet |
-| Opening per audit without attention, 3 layers / all / one layer | 42 KiB / 51 KiB / 34 KiB | not run yet (one layer plus 1 MiB of logits per token) |
-| Verifier per full audit, routine / all layers; per one-layer audit | 4.1 ms / 8.3 ms; 1.6 ms | not run yet |
-| Default challenge on 32 tokens (3 full + 29 decode audits) | 638 KiB, 45 ms, forged-boundary escape 6.3e-4 | not run yet |
-| Keygen time, key size | 0.01 s, 489 KiB (k = 16) | not run yet (estimate: 240 MB key) |
+| Decode tokens/s, capture off / on | about 340, overhead -6 to 15 % across runs | 12.2 / 9.3 (24 % overhead; 19 % in the demo run) |
+| Serve tokens/s incl. commitment, off / on | overhead 17 to 29 % | 12.1 / 6.5 (47 %: hashing about 10 MiB per position, 1.3 s for 56 positions) |
+| Retained state per position | 16.3 KiB | 10.2 MiB |
+| Opening per full audit, routine / all layers | 76 KiB / 167 KiB (3 / 6 layers) | 4.4 MiB / 16.9 MiB (10 / 48 layers) |
+| Opening per audit without attention, routine / all / one layer | 42 KiB / 51 KiB / 34 KiB | 3.0 MiB / 10.1 MiB / 1.2 MiB |
+| Verifier per full audit, routine / all layers; per one-layer audit | 4.1 ms / 8.3 ms; 1.6 ms | 216 ms / 894 ms; 39 ms (CPU) |
+| Default challenge on 32 tokens (3 full + 29 decode audits) | 638 KiB, 45 ms, forged-boundary escape 6.3e-4 | 51.9 MiB, 1.77 s, forged-boundary escape 0.27 |
+| Keygen time, key size | 0.01 s, 489 KiB (k = 16) | 98 s, 268.6 MiB (k = 16) |
 
-On the tiny model the serving overhead is dominated by hashing the commitment, since the forward
-pass is tiny. On real models the forward pass dominates.
+The GPU throughput is Hugging Face eager decoding at batch size 1 with no CUDA graphs or
+`torch.compile`, plus the CPU soft-cap and sampler (2.3 ms per token at a 262k vocabulary). Serving
+overhead on the real model is dominated by hashing the Tier 1 bf16 retained state (about 10 MiB
+per position). Tier 2's compact INT8 retained state is what brings that down.
 
 ## Real model on GPU (Modal, vast.ai as backup)
 
