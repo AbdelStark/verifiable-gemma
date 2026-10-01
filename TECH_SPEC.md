@@ -21,7 +21,7 @@ Source: `config.json` and `modeling_gemma4.py` for `google/gemma-4-31B-it` and `
 
 | Feature | 31B-it | 12B-it | Verification consequence |
 |---|---|---|---|
-| Model class | `Gemma4ForConditionalGeneration` (text decoder plus vision tower) | `Gemma4UnifiedForConditionalGeneration` | Discover the text decoder by module-name pattern, not class |
+| Model class | `Gemma4ForConditionalGeneration` (text decoder plus vision tower, `model_type gemma4`) | `Gemma4UnifiedForConditionalGeneration` (`model_type gemma4_unified`, text config `gemma4_unified_text`, same decoder) | Discover the text decoder by module-name pattern, not class |
 | Layers, hidden, heads | 60, 5376, 32 | 48, 3840, 16 | Per-layer-type shapes in the key |
 | Layer types | `sliding_attention` x5 then `full_attention`, repeating; final layer global | same | Pattern hashed in config; drives window and head_dim per layer |
 | Sliding window | 1024 | 1024 | KV provenance scope per layer |
@@ -29,7 +29,7 @@ Source: `config.json` and `modeling_gemma4.py` for `google/gemma-4-31B-it` and `
 | Global layers | head_dim 512 (`global_head_dim`), 4 KV heads (31B) / 1 (12B), `attention_k_eq_v = true` (no v_proj; V = v_norm(K before k_norm and RoPE)), RoPE theta 1e6, `rope_type = proportional`, `partial_rotary_factor = 0.25` | | Freivalds family set differs per layer type; one exact extra check: V derives from K |
 | Attention scaling | 1.0 (QK-norm replaces 1/sqrt(d)) | | Score replay uses no scale |
 | QK-norm | `q_norm`, `k_norm` RMSNorm with weight per head_dim; `v_norm` RMSNorm without weight | | Hookable modules; weights in key |
-| Decoder layer | `input_layernorm` -> attn -> `post_attention_layernorm` -> residual add -> `pre_feedforward_layernorm` -> MLP -> `post_feedforward_layernorm` -> residual add; then `hidden_states *= layer_scalar` (ones buffer) | | Four norms per layer in the bridge; two apply to sub-block outputs |
+| Decoder layer | `input_layernorm` -> attn -> `post_attention_layernorm` -> residual add -> `pre_feedforward_layernorm` -> MLP -> `post_feedforward_layernorm` -> residual add; then `hidden_states *= layer_scalar` (a bf16 checkpoint buffer, not ones: 12B layers 0/1/5/11/23/47 hold 0.053, 0.166, 0.355, 0.0045, 0.758, 0.048) | | Four norms per layer in the bridge; two apply to sub-block outputs; the residual replay multiplies by `layer_scalar` from the key |
 | RMSNorm | `x * (mean(x^2) + eps)^-0.5 * w` in float32 then cast; eps 1e-6; some instances without `w` | | Canonical f64 replay; the Llama `(1 + w)` form does not apply here |
 | MLP | `down_proj(gelu_tanh(gate_proj(x)) * up_proj(x))`, `hidden_activation = gelu_pytorch_tanh` | | GELU-tanh bridge instead of SiLU |
 | Embedding | `embed_tokens(ids) * embed_scale`, `embed_scale = sqrt(hidden_size)` cast to the weight dtype (bf16: 73.5 for 5376, 62.0 for 3840) | | Replay the bf16-rounded scale, not the float value |
@@ -97,12 +97,14 @@ Hooks are registered on modules found by regex under the text decoder (`layers.{
 | `self_attn.q_norm`, `self_attn.k_norm`, `self_attn.v_norm` | output (q_n, k_n, v_n), pre-RoPE | attention replay, provenance |
 | `self_attn.o_proj` | input (a), output (o) | Freivalds Wo; attention replay target |
 | `post_attention_layernorm` | output | bridge |
-| `pre_feedforward_layernorm` | output (x_ffn) | bridge; input to gate and up |
+| `pre_feedforward_layernorm` | input (r_mid), output (x_ffn) | residual chain; bridge; input to gate and up |
 | `mlp.gate_proj`, `mlp.up_proj` | outputs (g, u) | Freivalds |
 | `mlp.down_proj` | input (h), output (d) | GELU bridge; Freivalds Wdown |
 | `post_feedforward_layernorm` | output | bridge; residual out = r_mid + output |
-| final `norm` | input (r_final), output (h_final) | LM-head binding |
-| `lm_head` (or tied embedding matmul) | output pre-cap logits, upcast to f32 | decode |
+| final `norm` | input (r_final), output (h_final) | LM-head binding; captured as layer group `num_layers` |
+| `lm_head` (or tied embedding matmul) | output pre-cap logits (bf16 values), upcast to f32 | decode |
+
+Each tensor is captured once and used in every role it has: `o` is both the Wo output and the `post_attention_layernorm` input, `d` both the Wdown output and the `post_feedforward_layernorm` input, the next layer's `r_in` (or `r_final`) is the layer output. Per position and layer the leaf order is `r_in x_attn q k v q_n k_n v_n a o o_n r_mid x_ffn g u h d d_n` (no `v` on global layers), and `r_final h_final` for the final group.
 
 Per position the capture is a dict `{layer: {name: tensor}}` in the model dtype, plus `logits_precap` (f32), the sampler witness, and the token. Prefill captures `[n_prompt, dim]` slices once; each decode step captures `[1, dim]`. Positions are indexed over the full sequence (prompt then generated).
 
@@ -114,13 +116,14 @@ Retained-state size (bf16, 31B, per position): roughly 0.17 MB per layer, about 
 
 Canonical tensor bytes: `dtype_tag || ndim || shape (u32 LE each) || raw little-endian bytes` (bf16 as uint16). Hash: SHA-256 with domain separation: `H(tag || payload)` where tag is a fixed ASCII label (`"vg/tensor"`, `"vg/layer"`, `"vg/pos"`, `"vg/node"`, `"vg/leaf"`, `"vg/io"`, `"vg/seed"`, `"vg/receipt"`).
 
-- Layer leaf: `H("vg/layer" || layer_index || pos || concat(H(tensor) for each captured name in fixed order))`.
-- Position leaf: `H("vg/pos" || pos || concat(layer leaves) || H(logits_precap) || token_id || H(sampler witness))`.
+- Layer leaf: `H("vg/layer" || layer_index || pos || concat(H(tensor) for each captured name in fixed order))`; the final norm group is layer `num_layers`.
+- Position leaf: `H("vg/pos" || pos || input_token || body)` with `body = H("vg/pos_body" || concat(layer leaves) || H(logits_precap) || sampled_token (i32) || H(sampler witness))`; prompt positions that sample nothing use the zero digest and -1. The two levels let an opening bind the input token of every position (a token-only entry: token, body, proof) without opening anything else. A forward position `p` samples token `p + 1`; positions run over `[0, n_prompt + n_gen - 1)` because the last sampled token is never fed back.
+- Hash framing: `H(tag, parts) = SHA-256(len(tag) || tag || parts)`; JSON is canonical (`sort_keys`, compact separators).
 - Trace root: Merkle root over position leaves (power-of-two padding with a fixed empty-leaf hash).
 - Embedding root: Merkle root over `H("vg/tensor" || row_i)` for all vocabulary rows, computed once at keygen.
 - Weights root: Merkle root over `H(name || canonical bytes)` of every tensor in the safetensors files, sorted by name.
 - IO chain: `c_0 = H("vg/io" || prompt_hash)`, `c_t = H("vg/io" || c_{t-1} || token_t || H(logits_precap_t))`; `io_chain_head = c_{n_gen}`.
-- Seed commitment: `seed = H("vg/seed" || prover_secret || request_id)`, `seed_commitment = H("vg/seed" || seed || request_id)`; `seed` is revealed in the opening.
+- Seed commitment: with a client nonce (the default for `vg chat`) `seed = H("vg/seed_client" || nonce)`, so the prover cannot grind seeds; otherwise `seed = H("vg/seed" || prover_secret || request_id)`. `seed_commitment = H("vg/seed_commit" || seed || request_id)`; `seed` is revealed in the opening and the nonce is in the receipt.
 - Prompt hash: `H(token_ids after chat template)`; chat template hash and tokenizer hash from the canonical tokenizer JSON.
 
 Receipt (JSON, version 1):
@@ -137,9 +140,11 @@ Receipt (JSON, version 1):
     "sliding_window": 1024, "layer_types_hash": "…", "attention_k_eq_v": true,
     "rope_hash": "…", "qk_norm": true, "thinking": false,
     "chat_template_hash": "…", "tokenizer_hash": "…",
-    "speculative": "none", "prefix_caching": false
+    "speculative": "none", "prefix_caching": false,
+    "max_new_tokens": 128, "eos_token_ids": [1, 50, 106],
+    "sampler": "vg-sampler-1", "softcap_impl": "vg-canon-softcap-1", "lm_head": "f32"
   },
-  "prompt_hash": "…", "seed_commitment": "…",
+  "prompt_hash": "…", "seed_commitment": "…", "client_nonce": "…",
   "n_prompt": 57, "n_gen": 184,
   "trace_root": "…", "io_chain_head": "…",
   "prover": {"id": "…", "signature": "ed25519:…"}
@@ -166,7 +171,7 @@ Keygen streams tensors with `safetensors` memory mapping; peak memory is one mat
 
 - Build the prompt with `apply_chat_template` (thinking off unless requested), tokenize, compute `prompt_hash`.
 - Prefill: one forward with hooks on; capture all positions.
-- Decode: own loop with `DynamicCache`; each step one forward of the last token; hooks capture; `logits_precap` taken from the LM head output for the last position, upcast to f32, moved to CPU.
+- Decode: own loop with `DynamicCache`; each step one forward of the last token; hooks capture; `logits_precap = f32(E) @ f32(h_final)` computed by the engine in true f32 (TF32 off; the head served by the model, upcast once), moved to CPU. An f32 head keeps the LM-head binding tight enough that no single logit can be steered (see section 11).
 - Soft-cap and sampling on CPU in f32/f64 with the shared sampler; the witness records the uniform draw(s) and the post-cap logits hash.
 - Stop at EOS or `max_new_tokens`.
 - Commit: compute layer leaves, position leaves, trace root, IO chain; write retained state to disk under `request_id` (safetensors per position or per layer); build and sign the receipt.
@@ -191,40 +196,46 @@ def sample(logits_postcap_f32, temperature, top_k, top_p, rng) -> (token, witnes
     if top_k: keep the top_k largest, others -> -inf
     p = softmax(z)
     if top_p < 1: sort descending, keep smallest prefix with cumulative >= top_p, renormalise
-    u = rng.uniform()               # from numpy.random.default_rng(seed_bytes) advanced per step
+    u = uniform(seed, t)            # (int(H("vg/u" || seed || t)[:8], LE) >> 11) / 2^53
     token = inverse CDF over the kept set in index order
     witness = {"u": u, "step": t}
 ```
 
-Determinism rules: float64 everywhere after the f32 input; fixed tie-breaking (lowest index); `rng` is `numpy.random.default_rng(int.from_bytes(seed, "little"))` advanced exactly once per step. The verifier runs this function on the opened logits and must get the committed token.
+Determinism rules: float64 everywhere after the f32 input; fixed tie-breaking (lowest index, stable sorts); `exp` is the canonical `canon.exp_f64` (Cody-Waite reduction plus a degree-13 polynomial, basic IEEE operations only) and cumulative sums are sequential, so no libm or numpy-version dependence; one uniform per step derived from the revealed seed by SHA-256 (portable across numpy versions, unlike a `default_rng` stream). The soft-cap is likewise canonical (`canon.softcap`, f32 in, f32 out, `tanh` from `exp_f64`) and applied by the prover on CPU. The verifier runs these functions on the opened logits and must get the committed token.
 
 ## 10. Verifier
 
 Inputs: receipt, opening, key, public params. No GPU, no weights.
 
-Order of checks (fail fast, reason code on first failure, coverage table always printed):
+Order of checks (fail fast, reason code on first failure, coverage table always printed). As implemented: receipt schema and signature, opening schema, roots, manifest, seed, prompt, IO chain; then wiring (names and shapes of every opened layer group) and completeness; then the Merkle proof of every opened position (challenged positions first, then K/V provenance rows); then the per-position semantic checks below.
+
+Reason codes: `RECEIPT_SCHEMA`, `RECEIPT_SIGNATURE`, `OPENING_SCHEMA`, `WEIGHTS_ROOT`, `CONFIG_HASH`, `MANIFEST_UNSUPPORTED`, `MANIFEST_MISMATCH`, `SEED_COMMITMENT`, `PROMPT_BINDING`, `IO_CHAIN`, `MERKLE_POSITION`, `EMBEDDING`, `FREIVALDS_WQ|WK|WV|WO|WGATE|WUP|WDOWN`, `BRIDGE_NORM_INPUT|POST_ATTN|PRE_FFN|POST_FFN|Q|K|V|FINAL`, `BRIDGE_GELU`, `BRIDGE_RESIDUAL`, `WIRING`, `KV_PROVENANCE`, `ATTN_REPLAY`, `KV_SHARED`, `LMHEAD_BINDING`, `DECODE_SOFTCAP`, `DECODE_SAMPLING`. Added to the draft list: `OPENING_SCHEMA` (opening malformed, for another request, or not answering the challenge, including withheld challenged tensors or logits), `MANIFEST_MISMATCH` (soft-cap, embed scale, eps, EOS ids, tokenizer or chat-template hash differ from the checkpoint), `BRIDGE_NORM_FINAL` (final norm replay).
 
 1. `RECEIPT_SIGNATURE`, `RECEIPT_SCHEMA`.
 2. `WEIGHTS_ROOT`, `CONFIG_HASH`: receipt values equal public params.
-3. `MANIFEST_UNSUPPORTED`: speculative off, prefix caching off, attention implementation in the supported set, dtype bf16.
+3. `MANIFEST_UNSUPPORTED`: speculative off, prefix caching off, attention implementation in the supported set (`sdpa`, `eager`), dtype bf16, sampler and soft-cap implementation ids known. `MANIFEST_MISMATCH`: model-derived fields equal the checkpoint's. `WIRING`: `sliding_window`, `layer_types_hash`, `attention_k_eq_v`, `rope_hash`, `qk_norm` equal the profile's.
 4. For each challenged position `p`:
    1. `MERKLE_POSITION`: recompute the position leaf from opened tensors and the provided sibling layer leaves; verify the proof to `trace_root`.
-   2. `IO_CHAIN` (generated positions): chain segment recomputed from opened tokens and logits hashes matches the opened chain values and, for the last position, `io_chain_head`.
+   2. `IO_CHAIN` (generated positions): the opening carries the whole transcript `[(token_t, H(logits_precap_t))]`; the verifier recomputes the chain to `io_chain_head`, checks `len == n_gen`, the stop rule (EOS only as the last token, otherwise `n_gen == max_new_tokens`), and that every opened position's tokens and logits hash agree with it.
    3. `EMBEDDING` (position 0 of a challenge, or any position where the row is opened): Merkle proof of the row to `embedding_root`; `r_in[layer 0] == bf16(row * embed_scale_bf16)` exactly.
    4. For each challenged layer `l`:
       - `FREIVALDS_WQ|WK|WV|WO|WGATE|WUP|WDOWN`: `|r·y - v·x| <= tau(y)` (section 11).
       - `BRIDGE_NORM_*`: `rmsnorm_gemma(input) ≈ captured output` for `input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm`, `post_feedforward_layernorm`, `q_norm`, `k_norm`, `v_norm` (no weight).
       - `BRIDGE_GELU`: `gelu_tanh(g) * u ≈ h`.
-      - `BRIDGE_RESIDUAL`: `r_in + post_attention_out ≈ r_mid` (r_mid is `pre_feedforward_layernorm` input) and `r_mid + post_feedforward_out ≈ r_in[l+1]` (or `norm` input for the last layer); `layer_scalar` is ones and is asserted from the config.
+      - `BRIDGE_RESIDUAL` (exact): `r_mid == bf16(r_in + post_attention_out)` and `r_in[l+1] == bf16(bf16(r_mid + post_feedforward_out) * layer_scalar)` (or the `norm` input for the last layer), with `layer_scalar` from the key; a bf16 add or product with f32 opmath is replayed bit for bit.
       - `WIRING`: shapes of q, k, v match the layer type (head_dim 256 or 512, KV head counts), `v_proj` absent on global layers, `rope_hash` matches, `qk_norm` present.
       - `KV_PROVENANCE` (attention audit): opened `k_n`, `v_n` rows for the attention window of this layer at position `p` each come with their position-leaf proof (or the whole leaf set if the context is short).
-      - `ATTN_REPLAY` (generated positions only): recompute RoPE on `q_n` and `k_n` rows (partial 0.25 on global layers, full on sliding), scores `q·k^T` (scale 1.0), causal and window mask, softmax in f64, `attn = weights @ v_n`, compare to captured `a` within tolerance. Reported as audited.
-      - `KV_SHARED` (global layers): `v_n == rmsnorm_noweight(k_pre)` exactly in the model dtype.
+      - `ATTN_REPLAY` (every challenged position): recompute RoPE on `q_n` and `k_n` rows (partial 0.25 on global layers, full on sliding) with the rounding of the bf16 forward (bf16 cos/sin, three roundings; bit-exact against transformers), scores `q·k^T` (scale 1.0), causal and window mask (`kv > q - W`), softmax in f64, `attn = weights @ v_n`, compare to captured `a`: per head `||a - ref|| / (||ref|| + 2^-14 sqrt(d)) <= 2^-5`. Reported as audited.
+      - `KV_SHARED` (global layers): `v_n` within 1 bf16 ulp of `bf16(rmsnorm_noweight(k_pre))` (the f32 reduction order of the mean differs between devices, so bit equality is not portable; 0 ulps observed on CPU).
    5. `LMHEAD_BINDING`: `|r_lm · logits_precap - v_lm · h_final| <= tau`.
-   6. `DECODE_SOFTCAP`: `softcap(logits_precap) == opened logits_postcap` bit-exact in f32.
+   6. `DECODE_SOFTCAP`: the verifier computes `softcap(logits_precap)` with the canonical f32 function and requires its hash to equal the `postcap` hash in the committed sampler witness (post-cap logits are not sent).
    7. `DECODE_SAMPLING`: shared sampler on opened post-cap logits with the revealed seed reproduces the committed token; greedy if the manifest says greedy.
-5. `SEED_COMMITMENT`: `H(seed || request_id) == seed_commitment`.
-6. `PROMPT_BINDING`: when the prompt tokens are opened, their hash equals `prompt_hash`.
+5. `SEED_COMMITMENT`: `H(seed || request_id) == seed_commitment`, and `seed == H(nonce)` when the receipt carries a client nonce.
+6. `PROMPT_BINDING`: the prompt tokens are always opened and their hash equals `prompt_hash`.
+
+Challenges are per-position audits `{pos, layers, attention}` (docs/DECISIONS.md 37). Each audited position gets the embedding check, a full audit of its own independently drawn layers, the attention audit if flagged, and the decode checks if it samples a token. By default these are 3 full audits (routine layers plus attention) and, for every other generated token, a decode audit with one random layer. Every other position is opened token-only. A residual stream forged at one layer boundary at every position escapes with `prod_a (1 - |layers_a| / L)`; a fake attention output at one layer escapes with the same product over the audits that replay attention. Both are reported in the verdict.
+
+Hardening after the soundness review (docs/DECISIONS.md 26 to 41): the challenge is an input of the verifier (the auditor's, drawn at random after the receipt), never the prover's echo; decode checks (steps 4.5 to 4.7 plus the final norm) run at every audited position that samples a token, by default every generated token; `verify(expected=...)` binds the receipt to the client's request (prompt, policy, `max_new_tokens`, thinking, nonce); every opened tensor must be finite and every tolerance check requires a finite deviation and bound; a layer group is either a committed leaf or opened tensors, never both.
 
 Verdict JSON:
 
@@ -238,6 +249,16 @@ Verdict JSON:
 
 ## 11. Freivalds with a bf16 tolerance (Tier 1)
 
+**As implemented** (supersedes the single-vector L1 bound below, which cannot detect the section 8 weights tamper: with one ±1 vector `|r·Δy| ~ ||Δy||_2` while `2^-7 ||y||_1 ~ 2^-7 sqrt(m) ||y||_2`, so a 3 % change is below the bound for any `m > 32`, e.g. 0.39 vs 0.03 at m = 3840):
+
+- `k` independent secret Rademacher vectors per family (default 16, SHAKE-256 keyed by a secret seed), `v_j = r_j^T W` in float64.
+- Statistic `T = sqrt(mean_j (r_j·y - v_j·x)^2)`. The rounding error `e = y - Wx` is independent of the secret `r`, so `E[T^2] = ||e||_2^2 <= (u ||y||_2)^2` with `u = 2^-8`.
+- Bound `tau = (3u + 8 sqrt(K) 2^-24) ||y||_2` (three times the worst-case rounding norm plus an f32 accumulation allowance for inner dimension K). An honest prover exceeds it only if a chi-square(k) variable exceeds 9k: below 1e-20 for k = 16 even with every element at half an ulp. Measured honest `T/tau` on tiny CPU: 21 to 25 %.
+- Detection: a change moving `y` by `Δ` gives `T ~ ||Δ||_2`, so changes above about 1.2 % of `||y||_2` fail with overwhelming probability; the 3 % rank-8 tamper is rejected on every layer of the tiny model (observed `T/tau` about 2.4).
+- The LM-head binding uses the same statistic with `y = logits_precap` (bf16 values from the GPU LM head, so `u = 2^-8`, `K = hidden`).
+
+Draft text kept for reference:
+
 For a projection `y = W x` computed on GPU in bf16 inputs with f32 accumulation and bf16 output rounding, and verifier-side float64 arithmetic with `r` in {-1,+1}^m and `v = r^T W` precomputed in float64:
 
 - Exact identity: `r·(W x) = v·x`.
@@ -250,7 +271,7 @@ The verdict prints both the deviation and `tau` for every family so the margin i
 
 Tier 2 replaces this with CommitLLM's exact INT8 field check (soundness error about 2^-32 per check, no tolerance).
 
-The LM-head binding uses the same bound with `y = logits_precap` (f32, so `u = 2^-24` on the output but the input `h_final` is bf16; the bound is dominated by the accumulation term over `K = hidden`; use `tau = 2^-10 * ||logits||_1` as a conservative setting and print it).
+The LM-head binding uses the same bound with `y = logits_precap` computed in f32 (`u = 2^-24`; the products of bf16 values are exact in f32, so the bound is dominated by the accumulation term over `K = hidden`). As implemented this is the RMS statistic of this section with `u = 2^-24`: about `3e-5 ||y||_2` for K = 3840, so one logit can move by at most about 0.015 logit RMS on Gemma 4 (with bf16 logits the same L2 bound allowed about 6 RMS, enough to choose the token).
 
 ## 12. Tiny mode
 
@@ -264,17 +285,17 @@ CLI (all via `uv run`; on Modal the same commands run inside the functions in `i
 vg tiny     --out ./tiny-gemma4                               # build the tiny checkpoint
 vg keygen   --model <dir|hf-id> --out ./keys/<name>            # key.npz (secret) + public.json
 vg serve    --model <dir|hf-id> --public ./keys/<name>/public.json --port 8000 [--tamper weights|identity|sampling|softcap] [--device cuda|cpu]
-vg chat     --server http://localhost:8000 --prompt "…" [--max-new-tokens 128] [--thinking]   # prints text + saves receipt.json
-vg audit    --server … --receipt receipt.json --positions 17,98,151 --layers routine|full|<list> --out opening.bin
-vg verify   --key ./keys/<name>/key.npz --public … --receipt receipt.json --opening opening.bin [--deep]
+vg chat     --server http://localhost:8000 --model <dir|hf-id> --prompt "…" [--max-new-tokens 128] [--thinking]   # receipt.json + request.json (prompt tokens, nonce, prover id)
+vg audit    --server … --receipt receipt.json [--positions random:3] [--layers routine|full|<list>] [--decode all-gen] [--decode-layers 1] --out opening.bin   # + challenge.json
+vg verify   --key ./keys/<name>/key.npz --public … --receipt receipt.json --opening opening.bin --challenge challenge.json [--request request.json] [--deep]
 vg demo     --model … [--tiny] [--device …]                    # honest PASS, four tampers FAIL, cost summary
 vg bench    --model … [--tiny]                                 # overhead, retained bytes, opening bytes, verify ms
 ```
 
 HTTP:
 
-- `POST /chat {messages, max_new_tokens, thinking, sampling overrides?}` -> `{text, token_ids, receipt}`
-- `POST /audit {request_id, positions, layers, open_prompt_tokens?}` -> opening (binary: safetensors blob plus JSON index)
+- `POST /chat {messages, max_new_tokens, thinking, sampling overrides?, nonce?}` -> `{text, token_ids, receipt, timings}`
+- `POST /audit {request_id, audits: [{pos, layers, attention}], tier}` -> opening (binary: safetensors blob plus JSON index)
 - `GET /health` -> model id, weights root, config hash, prover id, retained requests count
 
 Opening layout: `index.json` (positions, layers, which tensors, proofs) and `tensors.safetensors` (opened tensors keyed `p{pos}/l{layer}/{name}`, logits keyed `p{pos}/logits_precap` and `p{pos}/logits_postcap`), the revealed seed and witnesses, sibling layer leaves per position, Merkle paths.
