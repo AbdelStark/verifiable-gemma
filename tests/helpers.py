@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import hashlib
+import itertools
 import json
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +18,7 @@ from vgemma.prover.sampler import SamplingPolicy
 from vgemma.verifier.verify import verify
 
 PROMPT = "Hello tiny Gemma, please tell me a short story about a lighthouse."
+_RUNS: collections.defaultdict[str, itertools.count] = collections.defaultdict(itertools.count)
 
 
 # ---------------------------------------------------------------------------
@@ -44,8 +48,10 @@ class Run:
         random: bool = False,
     ):
         self.engine = engine
-        if nonce is None and request_id is not None:  # reproducible across test sessions
-            nonce = hashlib.sha256(b"test-nonce/" + request_id.encode()).digest()
+        if nonce is None:  # reproducible across sessions and machines: no dependence on the prover secret
+            test = os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0]
+            label = request_id or f"{test}#{next(_RUNS[test])}"  # per-test counter: independent of test order
+            nonce = hashlib.sha256(b"test-nonce/" + label.encode()).digest()
         self.result = engine.generate(
             messages=[{"role": "user", "content": prompt}],
             max_new_tokens=max_new_tokens,

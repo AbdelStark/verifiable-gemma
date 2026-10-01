@@ -55,7 +55,7 @@ def test_infinite_logit_forcing_a_token(make_engine, keys):
         return z
 
     eng = wrap_logits(make_engine(), force)
-    r = Run(eng, positions="random", layers="full")
+    r = Run(eng, request_id="r_rev0058", positions="random", layers="full")
     expect(check(keys, r.receipt, r.opening, r.challenge, prover_id=eng.identity.id), "OPENING_SCHEMA")
 
 
@@ -64,7 +64,7 @@ def test_infinite_logit_forcing_a_token(make_engine, keys):
 
 def test_leaf_plus_fabricated_tensors(make_engine, keys):
     eng = make_engine()
-    r = Run(eng)
+    r = Run(eng, request_id="r_rev0067")
     trace, com = eng.store.load(r.receipt["request_id"])
     p = r.full_positions[0]
 
@@ -97,7 +97,7 @@ def test_tokens_forged_outside_challenged_positions(make_engine, keys):
         return z
 
     eng = wrap_logits(make_engine(), forge)
-    r = Run(eng, max_new_tokens=n, positions="edges", layers="full")
+    r = Run(eng, request_id="r_rev0100", max_new_tokens=n, positions="edges", layers="full")
     v = check(keys, r.receipt, r.opening, r.challenge)
     expect(v, "LMHEAD_BINDING")
     assert v["position"] not in r.full_positions  # caught at a decode-only position
@@ -107,7 +107,7 @@ def test_tokens_forged_outside_challenged_positions(make_engine, keys):
 
 
 def test_prompt_must_be_opened(engine, keys):
-    r = Run(engine)
+    r = Run(engine, request_id="r_rev0110")
     op = mutate_opening(r.opening, lambda idx, t: idx.__setitem__("prompt_tokens", None))
     expect(check(keys, r.receipt, op, r.challenge), "PROMPT_BINDING")
 
@@ -148,7 +148,7 @@ def test_claiming_the_real_prompt_hash(engine, keys):
 
 
 def test_policy_must_match_client_request(engine, keys):
-    r = Run(engine, policy=SamplingPolicy(temperature=0.5))
+    r = Run(engine, request_id="r_rev0151", policy=SamplingPolicy(temperature=0.5))
     asked = {"temperature": 1.0, "top_k": 64, "top_p": 0.95, "greedy": False, "max_new_tokens": 12, "thinking": False}
     assert check(keys, r.receipt, r.opening, r.challenge)["result"] == "PASS"
     expect(check(keys, r.receipt, r.opening, r.challenge, expected=asked), "MANIFEST_MISMATCH")
@@ -160,7 +160,7 @@ def test_policy_must_match_client_request(engine, keys):
 
 
 def test_challenge_is_required(engine, keys):
-    r = Run(engine)
+    r = Run(engine, request_id="r_rev0163")
     expect(check(keys, r.receipt, r.opening, None), "OPENING_SCHEMA")
 
 
@@ -189,7 +189,7 @@ def test_argmax_flip_by_sparse_logit_boost(make_engine, keys):
         return z
 
     eng = wrap_logits(make_engine(), flip_top2)
-    r = Run(eng, policy=SamplingPolicy(greedy=True), positions="random", layers="full")
+    r = Run(eng, request_id="r_rev0192", policy=SamplingPolicy(greedy=True), positions="random", layers="full")
     expect(check(keys, r.receipt, r.opening, r.challenge), "LMHEAD_BINDING")
 
 
@@ -201,7 +201,7 @@ def test_boost_below_former_bf16_bound_is_caught(make_engine, keys):
         return z
 
     eng = wrap_logits(make_engine(), nudge)
-    r = Run(eng, policy=SamplingPolicy(greedy=True), positions="random", layers="0")
+    r = Run(eng, request_id="r_rev0204", policy=SamplingPolicy(greedy=True), positions="random", layers="0")
     expect(check(keys, r.receipt, r.opening, r.challenge), "LMHEAD_BINDING")
 
 
@@ -234,7 +234,7 @@ def test_nonce_grinding_is_detected_by_expectation(engine, keys):
 
 
 def test_receipt_schema_rejects_bad_nonce(engine, keys):
-    r = Run(engine)
+    r = Run(engine, request_id="r_rev0237")
     receipt = copy.deepcopy(r.receipt)
     receipt["client_nonce"] = "zz"
     expect(check(keys, receipt, r.opening, r.challenge), "RECEIPT_SCHEMA")
@@ -242,7 +242,7 @@ def test_receipt_schema_rejects_bad_nonce(engine, keys):
 
 def test_witness_postcap_binding(engine, keys):
     """The verifier recomputes the post-cap logits; the witness must commit to exactly those."""
-    r = Run(engine, positions="random", layers="0")
+    r = Run(engine, request_id="r_rev0245", positions="random", layers="0")
     index, tensors = decode_opening(r.opening)
     p = r.full_positions[0]
     assert (
@@ -290,12 +290,14 @@ def p_inject_layer5(lm):
 @pytest.mark.parametrize("patch,producer", [(p_forge_final, 5), (p_inject_layer5, 4)], ids=["r_final", "layer5_input"])
 def test_forged_boundary_caught_by_decode_audits(make_engine, keys, patch, producer):
     eng = make_engine(patch=patch)
-    r = Run(eng, layers="0,1,2", decode_layers=(producer,))  # full audits miss it; decode audits do not
+    r = Run(
+        eng, request_id="r_rev0293", layers="0,1,2", decode_layers=(producer,)
+    )  # full audits miss it; decode audits do not
     assert r.result.text.startswith("FORGED")
     v = check(keys, r.receipt, r.opening, r.challenge)
     expect(v, "BRIDGE_RESIDUAL")
     assert v["layer"] == producer
-    missed = Run(eng, layers="0,1,2", decode="none")  # the earlier, shared-layer challenge
+    missed = Run(eng, request_id="r_rev0298", layers="0,1,2", decode="none")  # the earlier, shared-layer challenge
     assert check(keys, missed.receipt, missed.opening, missed.challenge)["result"] == "PASS"
 
 
@@ -361,15 +363,15 @@ def test_fake_attention_output_needs_attention_audits(make_engine, keys):
     from vgemma.auditor import challenge_from, forged_boundary_escape
 
     eng = make_engine(patch=p_fake_attention_last_layer)
-    r = Run(eng, layers="0,1,2", decode_layers=(5,))
+    r = Run(eng, request_id="r_rev0364", layers="0,1,2", decode_layers=(5,))
     v = check(keys, r.receipt, r.opening, r.challenge)
     assert v["result"] == "PASS"  # documented open item: layer 5 audited, but without the attention replay
     # priors over uniformly drawn layers: 3 attention audits of 3/6 layers; one-layer decode audits elsewhere
     sc = v["spot_check"]
     assert sc["fake_attention_escape"] == forged_boundary_escape(r.challenge, 6, attention_only=True) == 0.5**3
     assert abs(sc["forged_boundary_escape"] - 0.5**3 * (5 / 6) ** len(r.decode_positions)) < 1e-12
-    gen = r.decode_positions
-    ch = challenge_from(r.receipt["request_id"], gen[:1], [5], attention=True)
+    gen = decode_positions(r.receipt)  # never empty, unlike the decode-only audits when the answer is short
+    ch = challenge_from(r.receipt["request_id"], gen[-1:], [5], attention=True)
     expect(check(keys, r.receipt, eng.open(r.receipt["request_id"], ch), ch), "ATTN_REPLAY")
     with_attn = make_challenge(r.receipt, 6, layers="0", decode_layers=1, decode_attention=True)
     assert all(a["attention"] for a in with_attn["audits"])
